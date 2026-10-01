@@ -41,6 +41,10 @@ const CONFIG = {
   MAX_RUNTIME_MS: 4.5 * 60 * 1000, // Apps Script kills a run at 6 minutes
   CHECKPOINT_EVERY: 100, // messages between saved progress points
 
+  // Gmail allows each user about 250 quota units per second. Staying well
+  // under leaves room for your phone and other apps using the same mailbox.
+  UNITS_PER_SECOND: 100,
+
   // Senders on these domains get a label per address, not per domain.
   PERSONAL_DOMAINS: [
     'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com',
@@ -93,8 +97,13 @@ function processEmails() {
     if (state.phase === 'history' && Date.now() < deadline) {
       runHistory_(state, deadline, labels);
     }
-    // Errors are deliberately not swallowed: a failed run shows up in the
-    // Executions page and in Google's failure emails.
+  } catch (e) {
+    // Being told to slow down is routine: progress is saved, so end the run
+    // quietly and resume on the next trigger. Anything else is a real error
+    // and is rethrown, so it shows on the Executions page and in Google's
+    // failure emails.
+    if (!isTransient_(e)) throw e;
+    console.warn(`Gmail asked to slow down; resuming next run. (${errorText_(e)})`);
   } finally {
     lock.releaseLock();
   }
@@ -114,7 +123,7 @@ function uninstall() {
     const ids = labels.senderIds();
     const root = labels.find(CONFIG.ROOT_LABEL);
     if (root) ids.push(root);
-    ids.forEach(id => Gmail.Users.Labels.remove('me', id));
+    ids.forEach(id => gmail_(COST.write, () => Gmail.Users.Labels.remove('me', id)));
     PropertiesService.getScriptProperties().deleteProperty(STATE_KEY);
     console.log(`Uninstalled: removed ${ids.length} labels and the trigger.`);
   });
@@ -139,7 +148,7 @@ function runScan_(state, deadline, labels) {
   while (Date.now() < deadline) {
     const options = { labelIds: ['INBOX'], maxResults: 500 };
     if (state.pageToken) options.pageToken = state.pageToken;
-    const response = Gmail.Users.Messages.list('me', options);
+    const response = gmail_(COST.list, () => Gmail.Users.Messages.list('me', options));
     const ids = (response.messages || []).map(m => m.id);
 
     if (processIds_(ids, state, deadline, labels) < ids.length) return;
@@ -167,7 +176,7 @@ function runHistory_(state, deadline, labels) {
 
     let response;
     try {
-      response = Gmail.Users.History.list('me', options);
+      response = gmail_(COST.history, () => Gmail.Users.History.list('me', options));
     } catch (e) {
       if (!isNotFound_(e)) throw e;
       // Gmail keeps history for about a week; past that, a rescan is the
@@ -243,10 +252,10 @@ function processIds_(ids, state, deadline, labels) {
 function reconcile_(id, labels, batch) {
   let message;
   try {
-    message = Gmail.Users.Messages.get('me', id, {
+    message = gmail_(COST.read, () => Gmail.Users.Messages.get('me', id, {
       format: 'metadata',
       metadataHeaders: ['From', 'Authentication-Results'],
-    });
+    }));
   } catch (e) {
     if (isNotFound_(e)) return; // deleted since the change was recorded
     throw e;
@@ -338,7 +347,7 @@ function getLabels_() {
   const load = () => {
     byName = new Map();
     senderIds = new Set();
-    for (const label of Gmail.Users.Labels.list('me').labels || []) {
+    for (const label of gmail_(COST.labels, () => Gmail.Users.Labels.list('me')).labels || []) {
       const key = label.name.toLowerCase();
       byName.set(key, label.id);
       if (key.startsWith(prefix)) senderIds.add(label.id);
@@ -354,11 +363,11 @@ function getLabels_() {
       const key = name.toLowerCase();
       if (!byName.has(key)) {
         try {
-          const label = Gmail.Users.Labels.create({
+          const label = gmail_(COST.write, () => Gmail.Users.Labels.create({
             name,
             labelListVisibility: 'labelShow',
             messageListVisibility: 'show',
-          }, 'me');
+          }, 'me'));
           byName.set(key, label.id);
           if (key.startsWith(prefix)) senderIds.add(label.id);
         } catch (e) {
@@ -371,7 +380,12 @@ function getLabels_() {
   };
 }
 
-/** Groups identical label changes into batchModify calls of up to 1,000 messages. */
+/**
+ * Groups identical label changes. batchModify costs ten times a single
+ * modify, so it only pays off for a group of 10+ messages; during the first
+ * scan most senders have one or two, and batching those is what blew the
+ * per-user quota in the first release.
+ */
 function newBatch_() {
   const groups = new Map();
   return {
@@ -382,11 +396,18 @@ function newBatch_() {
     },
     flush() {
       for (const group of groups.values()) {
+        const change = {};
+        if (group.add.length) change.addLabelIds = group.add;
+        if (group.remove.length) change.removeLabelIds = group.remove;
+
+        if (group.ids.length * COST.write < COST.batch) {
+          group.ids.forEach(id =>
+            gmail_(COST.write, () => Gmail.Users.Messages.modify(change, 'me', id)));
+          continue;
+        }
         for (let i = 0; i < group.ids.length; i += 1000) {
-          const body = { ids: group.ids.slice(i, i + 1000) };
-          if (group.add.length) body.addLabelIds = group.add;
-          if (group.remove.length) body.removeLabelIds = group.remove;
-          Gmail.Users.Messages.batchModify(body, 'me');
+          const body = Object.assign({ ids: group.ids.slice(i, i + 1000) }, change);
+          gmail_(COST.batch, () => Gmail.Users.Messages.batchModify(body, 'me'));
         }
       }
       groups.clear();
@@ -395,12 +416,40 @@ function newBatch_() {
 }
 
 
+/* ---------- Quota pacing ---------- */
+
+// Gmail's price per call, in quota units.
+const COST = { profile: 1, labels: 1, history: 2, read: 5, list: 5, write: 5, batch: 50 };
+
+let bucket_ = null;
+
+/**
+ * Runs one Gmail call, first waiting if needed so the run never spends more
+ * than CONFIG.UNITS_PER_SECOND. Apps Script can fire calls faster than Gmail
+ * allows, so pacing has to happen here rather than be left to retries.
+ */
+function gmail_(units, call) {
+  const rate = CONFIG.UNITS_PER_SECOND;
+  const now = Date.now();
+  if (!bucket_) bucket_ = { tokens: rate, at: now };
+  bucket_.tokens = Math.min(rate, bucket_.tokens + ((now - bucket_.at) / 1000) * rate);
+  bucket_.at = now;
+  if (bucket_.tokens < units) {
+    Utilities.sleep(Math.ceil(((units - bucket_.tokens) / rate) * 1000));
+    bucket_.tokens = units;
+    bucket_.at = Date.now();
+  }
+  bucket_.tokens -= units;
+  return call();
+}
+
+
 /* ---------- Helpers ---------- */
 
 function newScanState_() {
   return {
     phase: 'scan',
-    baseline: String(Gmail.Users.getProfile('me').historyId),
+    baseline: String(gmail_(COST.profile, () => Gmail.Users.getProfile('me')).historyId),
     historyId: null,
     pageToken: null,
     index: 0,
