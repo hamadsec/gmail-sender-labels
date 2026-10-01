@@ -47,7 +47,7 @@ Edit `CONFIG` at the top of `Code.gs`, then run `rescan()` to apply changes to e
 | `PERSONAL_DOMAINS` | gmail.com, outlook.com, … | Domains where each person gets their own label. |
 | `MULTI_PART_SUFFIXES` | co.uk, com.au, … | Country suffixes like `co.uk`, so `shop.co.uk` isn't grouped as `co.uk`. Add yours if it's missing. |
 | `TRIGGER_MINUTES` | `5` | How often it checks for changes (1, 5, 10, 15 or 30). |
-| `UNITS_PER_SECOND` | `100` | How fast it calls Gmail. Gmail allows about 250 per second per user; lower this if you see "Quota exceeded" warnings. |
+| `UNITS_PER_SECOND` | `50` | Top speed for Gmail calls. When Gmail says "slow down", the script halves its pace, retries, and speeds back up gradually — so you rarely need to touch this. |
 
 ## Commands
 

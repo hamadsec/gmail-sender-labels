@@ -41,9 +41,10 @@ const CONFIG = {
   MAX_RUNTIME_MS: 4.5 * 60 * 1000, // Apps Script kills a run at 6 minutes
   CHECKPOINT_EVERY: 100, // messages between saved progress points
 
-  // Gmail allows each user about 250 quota units per second. Staying well
-  // under leaves room for your phone and other apps using the same mailbox.
-  UNITS_PER_SECOND: 100,
+  // Starting pace for Gmail calls, in quota units per second. When Gmail
+  // says "slow down" the script halves its pace and retries the same call,
+  // so this only needs to be a sensible first guess.
+  UNITS_PER_SECOND: 50,
 
   // Senders on these domains get a label per address, not per domain.
   PERSONAL_DOMAINS: [
@@ -90,6 +91,7 @@ function processEmails() {
   }
   try {
     const deadline = Date.now() + CONFIG.MAX_RUNTIME_MS;
+    resetPace_(deadline);
     const state = loadState_() || newScanState_();
     const labels = getLabels_();
 
@@ -103,8 +105,12 @@ function processEmails() {
     // and is rethrown, so it shows on the Executions page and in Google's
     // failure emails.
     if (!isTransient_(e)) throw e;
-    console.warn(`Gmail asked to slow down; resuming next run. (${errorText_(e)})`);
+    console.warn(`Gmail still says slow down after backing off; resuming next run. (${errorText_(e)})`);
   } finally {
+    const m = pace_.meter;
+    console.log(`Gmail usage this run: ${m.calls} calls, ${m.units} units in ` +
+      `${Math.round((Date.now() - m.start) / 1000)}s; told to slow down ${m.throttled} times; ` +
+      `ended at ${pace_.rate} units/s.`);
     lock.releaseLock();
   }
 }
@@ -421,26 +427,58 @@ function newBatch_() {
 // Gmail's price per call, in quota units.
 const COST = { profile: 1, labels: 1, history: 2, read: 5, list: 5, write: 5, batch: 50 };
 
-let bucket_ = null;
+const pace_ = {};
+resetPace_(Infinity);
+
+function resetPace_(deadline) {
+  Object.assign(pace_, {
+    rate: CONFIG.UNITS_PER_SECOND,
+    tokens: CONFIG.UNITS_PER_SECOND,
+    at: Date.now(),
+    deadline,
+    meter: { calls: 0, units: 0, throttled: 0, start: Date.now() },
+  });
+}
 
 /**
- * Runs one Gmail call, first waiting if needed so the run never spends more
- * than CONFIG.UNITS_PER_SECOND. Apps Script can fire calls faster than Gmail
- * allows, so pacing has to happen here rather than be left to retries.
+ * Runs one Gmail call without exceeding the current pace. If Gmail still
+ * says "slow down", it halves the pace, waits (2, 4, 8, 16, 32 seconds) and
+ * retries the same call; each success then nudges the pace back up. That
+ * way progress is never lost to a quota error, whatever the account's real
+ * limit turns out to be.
  */
 function gmail_(units, call) {
-  const rate = CONFIG.UNITS_PER_SECOND;
-  const now = Date.now();
-  if (!bucket_) bucket_ = { tokens: rate, at: now };
-  bucket_.tokens = Math.min(rate, bucket_.tokens + ((now - bucket_.at) / 1000) * rate);
-  bucket_.at = now;
-  if (bucket_.tokens < units) {
-    Utilities.sleep(Math.ceil(((units - bucket_.tokens) / rate) * 1000));
-    bucket_.tokens = units;
-    bucket_.at = Date.now();
+  for (let attempt = 0; ; attempt++) {
+    waitForBudget_(units);
+    pace_.meter.calls++;
+    pace_.meter.units += units;
+    try {
+      const result = call();
+      pace_.rate = Math.min(CONFIG.UNITS_PER_SECOND, pace_.rate + 0.5);
+      return result;
+    } catch (e) {
+      const backoff = 2000 * 2 ** attempt;
+      if (!isTransient_(e) || attempt >= 4 || Date.now() + backoff > pace_.deadline) throw e;
+      pace_.meter.throttled++;
+      pace_.rate = Math.max(5, pace_.rate / 2);
+      Utilities.sleep(backoff);
+      pace_.tokens = 0;
+      pace_.at = Date.now();
+    }
   }
-  bucket_.tokens -= units;
-  return call();
+}
+
+function waitForBudget_(units) {
+  const now = Date.now();
+  pace_.tokens = Math.min(Math.max(pace_.rate, units),
+    pace_.tokens + ((now - pace_.at) / 1000) * pace_.rate);
+  pace_.at = now;
+  if (pace_.tokens < units) {
+    Utilities.sleep(Math.ceil(((units - pace_.tokens) / pace_.rate) * 1000));
+    pace_.tokens = units;
+    pace_.at = Date.now();
+  }
+  pace_.tokens -= units;
 }
 
 
